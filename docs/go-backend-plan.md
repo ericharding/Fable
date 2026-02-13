@@ -201,11 +201,14 @@ This is one of the most complex parts — study how the PHP backend handles
 `Fable.ForLoop` → Go `for i := start; i < limit; i++`.
 
 ### 3.5 Try/catch/finally
-`Fable.TryCatch` → Go doesn't have exceptions.
-**Design decision needed:** Options include:
-- Use `panic`/`recover` (closest to exceptions but not idiomatic)
-- Transform to error returns (idiomatic but changes semantics)
-- Use panic/recover for the initial implementation, document the tradeoff
+`Fable.TryCatch` → `panic`/`recover` in Go.
+- F# `raise` / `failwith` → `panic()`
+- F# `try/with` → `defer`/`recover` pattern
+- F# `try/finally` → `defer` (direct fit)
+- F# `Result` type → Go `Result[T, E]` generic struct in runtime library (not panic-based)
+
+The split: exceptions panic, Result values are values. This preserves F# semantics
+faithfully — `Result` is the preferred error-handling path; exceptions are exceptional.
 
 **Deliverable:** Pattern matching, conditionals, and loops work.
 
@@ -249,26 +252,34 @@ Need to handle both named functions-as-values and inline lambdas.
 - Implement structural equality (`Equals` method or `==` for simple cases)
 
 ### 5.2 Discriminated Unions → Go interfaces + concrete types
-**Strategy (interface-based):**
-```go
-type Shape interface { isShape() }
-type Circle struct { Radius float64 }
-func (Circle) isShape() {}
-type Rectangle struct { Width, Height float64 }
-func (Rectangle) isShape() {}
-```
-- Each union case becomes a concrete struct
-- A marker interface ties them together
-- Pattern matching uses type switches
+**Decision: Interface-based representation.**
 
-**Alternative (tag-based):**
 ```go
-type Shape struct {
-    Tag  int
-    Fields []interface{}
+// F#:  type Shape = Circle of radius: float | Rectangle of width: float * height: float
+// Go:
+type Shape interface { isShape() }
+
+type Shape_Circle struct { Radius float64 }
+func (Shape_Circle) isShape() {}
+
+type Shape_Rectangle struct { Width, Height float64 }
+func (Shape_Rectangle) isShape() {}
+
+// Pattern matching via type switch:
+switch s := shape.(type) {
+case Shape_Circle:
+    fmt.Println(s.Radius)
+case Shape_Rectangle:
+    fmt.Println(s.Width * s.Height)
 }
 ```
-Simpler but loses type safety. Recommend starting with interface-based.
+
+- Each union case becomes a concrete struct (prefixed with union type name to avoid collisions)
+- Marker interface ties them together
+- Pattern matching compiles to Go type switches
+- Cases with no fields can be singletons (package-level var)
+- `Option[T]` handled specially — uses `*T` (nil = None) for primitives,
+  or a `Some[T]`/`None` interface pair for nested options
 
 ### 5.3 Anonymous records
 `Fable.AnonymousRecordType` → Go struct literals or named generated types.
@@ -359,29 +370,137 @@ or a named generated type.
 
 ## Phase 8 — Async & Concurrency
 
-**Goal:** F# async workflows and tasks map to Go concurrency primitives.
+**Goal:** F# async workflows compile correctly. Goroutines exposed as a separate Go interop feature.
 
-### 8.1 Strategy decision
-Options:
-- **Goroutines + channels:** Most idiomatic Go, but semantic mismatch with F# async
-- **Promise-like wrapper type:** A `Task[T]` struct that wraps goroutine results
-- **Hybrid:** Use goroutines internally, expose promise-like API
+### Background: How Fable Sees Async
 
-Recommend starting with a `Task[T]` wrapper in fable-library-go that uses
-goroutines internally, since F# async is fundamentally about composable
-asynchronous computations, not concurrent message passing.
+The F# compiler desugars `async { ... }` into builder method calls **before**
+it reaches the Fable AST. By the time we see it, it's just:
 
-### 8.2 Async/Task builders
-- `Fable.Call` on async builder methods → Go runtime library calls
-- `async { ... }` → goroutine launch wrapped in Task
-- `let! x = ...` → channel receive or callback
-- `Async.Parallel` → `sync.WaitGroup` or similar
+```
+builder.Delay(fun () ->
+    builder.Bind(someAsync, fun x ->
+        builder.Return(x + 1)))
+```
 
-### 8.3 Basic concurrency primitives
-- Locks → `sync.Mutex`
-- Atomic operations → `sync/atomic`
+These are ordinary `Call` expressions in the Fable AST. The `Replacements.fs`
+module maps them to runtime library function calls.
 
-**Deliverable:** Simple async F# code runs using goroutines.
+The JS and Python backends **both** implement `Async[T]` as a CPS
+(Continuation-Passing Style) function:
+
+```
+type Async[T] = func(IAsyncContext[T])    // conceptually
+```
+
+Where `IAsyncContext` carries three continuations (success, error, cancel)
+plus a trampoline to prevent stack overflow. This is **not** language-native
+async/await — it's an explicit runtime.
+
+### 8.1 Why goroutines don't map to F# async
+
+F# async is about **composable deferred computations**:
+- Computations are values you can pass around, combine, and run later
+- `let!` chains computations sequentially via continuations
+- `Async.Parallel` runs multiple computations and collects results
+- Cancellation tokens propagate through the computation tree
+
+Go goroutines are about **concurrent execution**:
+- `go f()` launches and immediately runs — no deferred composition
+- No built-in way to get a return value from a goroutine
+- No built-in cancellation (need `context.Context`)
+- No built-in way to compose "run these N things, collect results"
+
+Mapping F# async directly to goroutines would require reinventing all the
+composition and cancellation machinery anyway — so it's better to implement
+a proper CPS runtime and use goroutines only as the underlying scheduler.
+
+### 8.2 CPS Async Runtime (`fable-library-go`)
+
+Implement in `src/fable-library-go/fable_library/async_builder.go`:
+
+```go
+// Core type: an async computation is a function that takes a context
+type Async[T any] func(ctx *AsyncContext[T])
+
+// Context carries continuations + cancellation + trampoline
+type AsyncContext[T any] struct {
+    OnSuccess  func(T)
+    OnError    func(error)
+    OnCancel   func(error)
+    CancelToken *CancelToken
+    Trampoline  *Trampoline
+}
+
+// Trampoline prevents stack overflow from deep continuation chains
+type Trampoline struct {
+    callCount int
+    maxCalls  int         // ~500 for Go (goroutine stacks grow, so higher than JS's 2000)
+    queue     []func()
+}
+```
+
+Builder methods to implement:
+- `Bind[T, U](Async[T], func(T) Async[U]) Async[U]` — chain computations
+- `Return[T](T) Async[T]` — wrap a value
+- `Zero() Async[struct{}]` — empty computation
+- `Delay[T](func() Async[T]) Async[T]` — deferred execution
+- `Combine[T](Async[struct{}], Async[T]) Async[T]` — sequence two computations
+- `While(func() bool, Async[struct{}]) Async[struct{}]` — loop
+- `TryWith[T](Async[T], func(error) Async[T]) Async[T]` — error handling
+- `TryFinally[T](Async[T], func()) Async[T]` — cleanup
+- `Using[T, D Disposable](D, func(D) Async[T]) Async[T]` — resource management
+
+Module functions (`async_.go`):
+- `Start(Async[struct{}])` — run on a goroutine (fire-and-forget)
+- `StartImmediate(Async[struct{}])` — run synchronously
+- `RunSynchronously[T](Async[T]) T` — block until complete (use channel)
+- `Sleep(int) Async[struct{}]` — delay (use `time.After`)
+- `Parallel[T]([]Async[T]) Async[[]T]` — run concurrently (goroutines + WaitGroup)
+- `Sequential[T]([]Async[T]) Async[[]T]` — run in order
+- `FromContinuations[T](func(success, error, cancel)) Async[T]` — interop escape hatch
+- `CancellationToken() Async[CancelToken]` — get current token
+- `Catch[T](Async[T]) Async[Result[T, error]]` — convert to Result
+
+### 8.3 F# Task support
+
+F# `task { ... }` could map to a simpler model since tasks are "hot" (start
+immediately). Options:
+- Reuse the CPS runtime but auto-start
+- Create a `Task[T]` wrapper around `chan T` (goroutine-backed)
+- Defer this to a later phase — async is more common in F# code
+
+### 8.4 Goroutines as a Go interop feature (separate from F# async)
+
+Expose Go concurrency as Fable.Core interop attributes:
+
+```fsharp
+// In Fable.Core.Go (future)
+[<GoRoutine>]
+let doWork () = ...              // compiles to: go doWork()
+
+let ch = Go.Channel<int>(10)    // compiles to: make(chan int, 10)
+Go.Send ch 42                   // compiles to: ch <- 42
+let v = Go.Receive ch           // compiles to: v := <-ch
+```
+
+This keeps goroutines as an explicit Go-specific escape hatch, orthogonal
+to the F# async model.
+
+### 8.5 Replacements mapping
+
+In `src/Fable.Transforms/Go/Replacements.fs`:
+```fsharp
+| "FSharpAsyncBuilder" ->
+    match i.CompiledName with
+    | "Singleton" -> makeImportLib com t "Singleton" "async_builder"
+    | "Bind" -> Helper.LibCall(com, "async_builder", "Bind", ...)
+    | "Return" -> Helper.LibCall(com, "async_builder", "Return_", ...)
+    | "Delay" -> Helper.LibCall(com, "async_builder", "Delay", ...)
+    // ... etc
+```
+
+**Deliverable:** `async { let! x = someAsync; return x + 1 }` compiles and runs correctly.
 
 ---
 
@@ -456,18 +575,18 @@ Start with simple tests and progressively enable more:
 
 ---
 
-## Key Design Decisions (to resolve before/during implementation)
+## Design Decisions (Resolved)
 
-| # | Decision | Options | Recommendation |
-|---|----------|---------|----------------|
-| 1 | **Union representation** | Interface-based vs. tag-based | Interface-based (type-safe) |
-| 2 | **Error handling** | panic/recover vs. error returns | panic/recover for MVP |
-| 3 | **Generics** | Go 1.18+ generics vs. interface{} | Go 1.18+ (minimum Go version) |
-| 4 | **Minimum Go version** | 1.18, 1.21, 1.22 | 1.21 (current LTS-ish) |
-| 5 | **Async model** | Goroutines, channels, Task wrapper | Task wrapper using goroutines |
-| 6 | **Immutability** | Enforce copies vs. trust convention | Trust convention (perf) |
-| 7 | **Currying** | Always curry vs. optimize direct calls | Optimize direct calls |
-| 8 | **AST complexity** | Minimal (PHP-like) vs. comprehensive | Start minimal, grow as needed |
+| # | Decision | Resolution | Notes |
+|---|----------|------------|-------|
+| 1 | **Union representation** | **Interface-based** | Each case = concrete struct; marker interface ties them; type switch for matching |
+| 2 | **Error handling** | **F# Result → Go Result; exceptions → panic** | Result[T,E] in runtime lib; try/catch compiles to panic/recover |
+| 3 | **Generics** | **Go 1.18+ generics** | Avoids `interface{}` everywhere, produces readable output |
+| 4 | **Minimum Go version** | **1.21** | Current LTS-ish, has generics + modern stdlib |
+| 5 | **Async model** | **Custom CPS runtime library** | See "Async Deep Dive" below |
+| 6 | **Immutability** | **Trust convention** | Performance over enforcement |
+| 7 | **Currying** | **Optimize direct calls** | Only wrap with currying when partial application is detected |
+| 8 | **AST complexity** | **Start minimal** | PHP-like ~150-250 lines, grow as needed |
 
 ---
 
